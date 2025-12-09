@@ -1,12 +1,5 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Jul 12 09:08:39 2017
-
-@author: Fahrettin
-"""
-
-# -*- coding: utf-8 -*-
-"""
 Created on Mon Jul 10 09:30:09 2017
 
 @author: Enes
@@ -423,3 +416,4 @@ def create_model_graph(trainingset, testset, encodedrandomtestset):
         ber = calculateBer(predictions, testlabels, numoftestsamples)
 
         print("ber: ", ber)
+
