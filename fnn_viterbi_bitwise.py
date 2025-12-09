@@ -1,360 +1,574 @@
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Created on Mon Jul 17 16:03:55 2017
+Bit-wise Neural Viterbi Decoder using Binary Classification.
+
+This module implements a neural network decoder that predicts bits individually
+using binary classification (0 or 1). Unlike the multiclass approach, this
+decoder can handle longer sequences by predicting one bit at a time.
+
+The decoder can start from any encoder state, making it suitable for
+sequential decoding scenarios.
+
+Author: Sinan
+Date: July 17, 2017
+Improved: December 2024
 """
 
+from typing import Tuple, Optional, Dict
+import math
 import tensorflow as tf
 import numpy as np
 from random import randint
-import math as math
-from sklearn.preprocessing import OneHotEncoder
-import matplotlib.pyplot as plt
 
 
-# Another strategy involves doing prediction bit per bit in binary classification sense. But unlike
-# neuralviterbiseqprection.py , we need to train state number of distinct classifier for every state so the algoritm decide
-# which of the next classifier will be used according to previous prediction
+# ==============================================================================
+# CONFIGURATION AND GLOBAL CONSTANTS
+# ==============================================================================
+
+class BitwiseDecoderConfig:
+    """Configuration container for bitwise neural decoder."""
+    
+    def __init__(
+        self,
+        constraint_length: int = 6,
+        block_length: int = 512,
+        n_hidden_1: int = 30,
+        n_hidden_2: int = 100,
+        n_hidden_3: int = 100,
+        n_hidden_4: int = 100,
+        learning_rate: float = 0.0002,
+        training_epochs: int = 300,
+        batch_size: int = 1000,
+        beta_regularization: float = 0.0001,
+        training_size: int = 300000,
+        test_size: int = 300000,
+        snr_db_range: Tuple[int, int] = (-2, 9),
+        test_snr_index: int = 0,
+        bit_position: int = 0,
+        starting_state: int = 0,
+    ):
+        """
+        Initialize bitwise decoder configuration.
+        
+        Args:
+            constraint_length: Constraint length of convolutional encoder
+            block_length: Number of information bits to decode
+            n_hidden_1: Neurons in first hidden layer
+            n_hidden_2: Neurons in second hidden layer
+            n_hidden_3: Neurons in third hidden layer
+            n_hidden_4: Neurons in fourth hidden layer
+            learning_rate: Adam optimizer learning rate
+            training_epochs: Number of training epochs
+            batch_size: Mini-batch size
+            beta_regularization: L2 regularization coefficient
+            training_size: Total training samples
+            test_size: Total test samples
+            snr_db_range: Range of SNR values for training (min, max)
+            test_snr_index: Index of SNR value for testing
+            bit_position: Position of bit to predict (0 to block_length-1)
+            starting_state: Initial encoder state (0 to 2^constraint_length-1)
+        """
+        # Encoder parameters
+        self.constraint_length = constraint_length
+        self.block_length = block_length
+        self.total_length = constraint_length + block_length
+        
+        # Network architecture
+        # Input includes constraint_length + block_length encoded bits (doubled)
+        self.n_input = 2 * self.total_length
+        self.n_hidden_1 = n_hidden_1
+        self.n_hidden_2 = n_hidden_2
+        self.n_hidden_3 = n_hidden_3
+        self.n_hidden_4 = n_hidden_4
+        self.n_output = 2  # Binary classification: [0, 1]
+        
+        # Training parameters
+        self.learning_rate = learning_rate
+        self.training_epochs = training_epochs
+        self.batch_size = batch_size
+        self.beta_regularization = beta_regularization
+        self.display_step = 1
+        
+        # Dataset parameters
+        self.training_size = training_size
+        self.test_size = test_size
+        
+        # Channel parameters
+        snr_db_vec = np.arange(snr_db_range[0], snr_db_range[1])
+        self.snr_db_vec = snr_db_vec
+        self.snr_vec = 10 ** (snr_db_vec / 10.0)
+        self.n0_vec = 1.0 / self.snr_vec
+        self.sigma_vec = np.sqrt(self.n0_vec * 0.5)
+        
+        # Test configuration
+        self.test_snr_index = test_snr_index
+        self.bit_position = bit_position
+        self.starting_state = starting_state
 
 
-def generateInfoSeq(blocklength):
-    infoseq = np.zeros(blocklength)
-    for i in range(blocklength):
-        infoseq[i] = randint(0, 1)
-    return infoseq
+# ==============================================================================
+# ENCODING FUNCTIONS
+# ==============================================================================
 
-
-def encode57(infoseq):
-    encodedseq = np.zeros(len(infoseq) * 2)
-    encodedseq[0] = infoseq[0]
-    encodedseq[1] = (infoseq[0] + infoseq[1]) % 2
-    encodedseq[2] = (infoseq[1]) % 2
-    encodedseq[3] = (infoseq[1] + infoseq[0]) % 2
-    for i in range(2, len(infoseq)):
-        encodedseq[2 * i] = (infoseq[i] + infoseq[i - 2]) % 2
-        encodedseq[2 * i + 1] = (infoseq[i] + infoseq[i - 1] + infoseq[i - 2]) % 2
-    return encodedseq
-
-
-# Encoder have a capacity of start at spesified state
-def encode133171(bits, statenum):
-    arr = extractBitssingle(statenum)
-    bits = np.append(arr, bits)
-
-    encoded_bits = np.zeros(len(bits) * 2)
-    encoded_bits[0] = (bits[0]) % 2
-    encoded_bits[1] = (bits[0]) % 2
-
-    encoded_bits[2] = (bits[1]) % 2
-    encoded_bits[3] = (bits[1] + bits[0]) % 2
-
-    encoded_bits[4] = (bits[2] + bits[0]) % 2
-    encoded_bits[5] = (bits[2] + bits[1] + bits[0]) % 2
-
-    encoded_bits[6] = (bits[3] + bits[1] + bits[0]) % 2
-    encoded_bits[7] = (bits[3] + bits[2] + bits[1] + bits[0]) % 2
-
-    encoded_bits[8] = (bits[4] + bits[2] + bits[1] + 0 + 0) % 2
-    encoded_bits[9] = (bits[4] + bits[3] + bits[2] + bits[1]) % 2
-
-    encoded_bits[10] = (bits[5] + bits[3] + bits[2] + bits[0]) % 2
-    encoded_bits[11] = (bits[5] + bits[4] + bits[3] + bits[2]) % 2
-
-    for i in range(6, len(bits)):
-        encoded_bits[2 * i] = (
-            bits[i] + bits[i - 2] + bits[i - 3] + bits[i - 5] + bits[i - 6]
-        ) % 2
-        encoded_bits[2 * i + 1] = (
-            bits[i] + bits[i - 1] + bits[i - 2] + bits[i - 3] + bits[i - 6]
-        ) % 2
-
-    return encoded_bits
-
-
-# modulate and add noise
-def modulateAwgn(encodedseq, sigma):
-    encodedseq[np.where(encodedseq == 0)] = -1
-    distortedseq = encodedseq + np.random.normal(0, sigma, len(encodedseq))
-    return distortedseq
-
-
-def generateInputVectors(length, number):
-    randomtestset = np.random.randint(2, size=(number, length))
-    return randomtestset
-
-
-# Blocklength is number of bit the system will try to decode at once
-constraintlength = 6
-blocklength = 512
-totallength = constraintlength + blocklength
-
-
-def extractBitssingle(arrval):
-    bits = np.zeros(6)
-    val = [int(x) for x in list("{0:0b}".format(arrval))]
-    bits[len(bits) - len(val) : len(bits)] = np.array(val)
+def extract_state_bits(state_number: int, constraint_length: int = 6) -> np.ndarray:
+    """
+    Convert encoder state number to binary representation.
+    
+    The encoder state is represented by the last (constraint_length - 1) bits
+    in the shift register.
+    
+    Args:
+        state_number: State number (0 to 2^constraint_length - 1)
+        constraint_length: Constraint length of encoder
+        
+    Returns:
+        Binary array of shape (constraint_length,) representing the state
+        
+    Example:
+        >>> extract_state_bits(5, 6)  # State 5 = 000101
+        array([0, 0, 0, 1, 0, 1])
+    """
+    bits = np.zeros(constraint_length, dtype=np.int32)
+    # Convert state number to binary string with fixed width
+    binary_str = format(state_number, f'0{constraint_length}b')
+    # Convert string to array, fill from right
+    binary_list = [int(b) for b in binary_str]
+    bits[len(bits) - len(binary_list):] = binary_list
     return bits
 
 
-def calHammingDistanceDecimal(val1, val2):
-    set1 = np.arange(blocklength)
-    set2 = 2**set1
-    biterr = 0
-    for i in range(blocklength):
-        if val1 % (2 * set2[i]) != 0 and val2 % (2 * set2[i]) == 0:
-            val1 = val1 - set2[i]
-            biterr = biterr + 1
-        elif val1 % (2 * set2[i]) == 0 and val2 % (2 * set2[i]) != 0:
-            val2 = val2 - set2[i]
-            biterr = biterr + 1
-        elif val1 % (2 * set2[i]) != 0 and val2 % (2 * set2[i]) != 0:
-            val2 = val2 - set2[i]
-            val1 = val1 - set2[i]
-    return biterr
+def encode_133171_with_state(
+    bits: np.ndarray,
+    state_num: int
+) -> np.ndarray:
+    """
+    Encode bits using (133,171) encoder starting from a specific state.
+    
+    This allows encoding to start from any encoder state, which is useful
+    for decoding in the middle of a sequence.
+    
+    Args:
+        bits: Information bits to encode
+        state_num: Initial encoder state (0 to 63 for constraint length 6)
+        
+    Returns:
+        Encoded sequence with length 2 * (len(bits) + constraint_length)
+        
+    Note:
+        The state bits are prepended to the information bits before encoding
+    """
+    # Get state bits and prepend to information bits
+    state_bits = extract_state_bits(state_num)
+    bits_with_state = np.concatenate([state_bits, bits])
+    
+    length = len(bits_with_state)
+    encoded_bits = np.zeros(length * 2, dtype=np.int32)
+    
+    # Encode first 6 bits (initialization phase)
+    encoded_bits[0] = bits_with_state[0] % 2
+    encoded_bits[1] = bits_with_state[0] % 2
+    
+    encoded_bits[2] = bits_with_state[1] % 2
+    encoded_bits[3] = (bits_with_state[1] + bits_with_state[0]) % 2
+    
+    encoded_bits[4] = (bits_with_state[2] + bits_with_state[0]) % 2
+    encoded_bits[5] = (bits_with_state[2] + bits_with_state[1] + bits_with_state[0]) % 2
+    
+    encoded_bits[6] = (bits_with_state[3] + bits_with_state[1] + bits_with_state[0]) % 2
+    encoded_bits[7] = (
+        bits_with_state[3] + bits_with_state[2] + 
+        bits_with_state[1] + bits_with_state[0]
+    ) % 2
+    
+    encoded_bits[8] = (bits_with_state[4] + bits_with_state[2] + bits_with_state[1]) % 2
+    encoded_bits[9] = (
+        bits_with_state[4] + bits_with_state[3] + 
+        bits_with_state[2] + bits_with_state[1]
+    ) % 2
+    
+    encoded_bits[10] = (
+        bits_with_state[5] + bits_with_state[3] + 
+        bits_with_state[2] + bits_with_state[0]
+    ) % 2
+    encoded_bits[11] = (
+        bits_with_state[5] + bits_with_state[4] + 
+        bits_with_state[3] + bits_with_state[2]
+    ) % 2
+    
+    # Encode remaining bits (steady state)
+    for i in range(6, length):
+        # G1 = 133 (octal) = 1011011 (binary)
+        encoded_bits[2 * i] = (
+            bits_with_state[i] + bits_with_state[i - 2] + 
+            bits_with_state[i - 3] + bits_with_state[i - 5] + 
+            bits_with_state[i - 6]
+        ) % 2
+        
+        # G2 = 171 (octal) = 1111001 (binary)
+        encoded_bits[2 * i + 1] = (
+            bits_with_state[i] + bits_with_state[i - 1] + 
+            bits_with_state[i - 2] + bits_with_state[i - 3] + 
+            bits_with_state[i - 6]
+        ) % 2
+    
+    return encoded_bits
 
 
-def generateTrainData(blocklength, trainingsize, noisevector, state):
-    traininginfoseq = generateInputVectors(blocklength, trainingsize)
-    #    traininginfoseq[:,0]=1
+# ==============================================================================
+# CHANNEL AND DATA GENERATION
+# ==============================================================================
 
-    traininginfoseq = traininginfoseq.astype(np.float32)
-    trainingencodedseq = np.array(
-        list(
-            map(
-                encode133171,
-                traininginfoseq.tolist(),
-                state * np.ones(len(traininginfoseq), dtype=np.uint8),
-            )
+def modulate_awgn(encoded_seq: np.ndarray, sigma: float) -> np.ndarray:
+    """
+    Apply BPSK modulation and add AWGN to encoded sequence.
+    
+    Args:
+        encoded_seq: Binary encoded sequence
+        sigma: Noise standard deviation
+        
+    Returns:
+        Noisy modulated sequence
+    """
+    modulated = encoded_seq.copy().astype(np.float32)
+    modulated[np.where(modulated == 0)] = -1
+    noise = np.random.normal(0, sigma, len(modulated))
+    return modulated + noise
+
+
+def generate_input_vectors(length: int, number: int) -> np.ndarray:
+    """
+    Generate random binary vectors.
+    
+    Args:
+        length: Length of each vector
+        number: Number of vectors to generate
+        
+    Returns:
+        Array of shape (number, length) with random binary values
+    """
+    return np.random.randint(2, size=(number, length))
+
+
+def generate_training_data(
+    config: BitwiseDecoderConfig
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generate training dataset with mixed SNR values.
+    
+    Args:
+        config: Decoder configuration
+        
+    Returns:
+        Tuple of (info_sequences, encoded_sequences)
+        - info_sequences: Shape (training_size, block_length)
+        - encoded_sequences: Shape (training_size, 2 * total_length)
+    """
+    # Generate random information sequences
+    info_seq = generate_input_vectors(
+        config.block_length,
+        config.training_size
+    ).astype(np.float32)
+    
+    # Encode all sequences starting from specified state
+    encoded_seq = np.array([
+        encode_133171_with_state(seq, config.starting_state)
+        for seq in info_seq
+    ])
+    
+    # Add noise with random SNR from available range
+    for i in range(config.training_size):
+        snr_idx = np.random.randint(len(config.sigma_vec))
+        encoded_seq[i, :] = modulate_awgn(
+            encoded_seq[i, :],
+            config.sigma_vec[snr_idx]
         )
-    )
-
-    for i in range(trainingsize):
-        ind = np.random.randint(len(noisevector), size=1)
-        trainingencodedseq[i, :] = modulateAwgn(
-            trainingencodedseq[i, :], noisevector[ind]
-        )
-    return (traininginfoseq, trainingencodedseq)
+    
+    return info_seq, encoded_seq
 
 
-def generateTestData(blocklength, testsize, noisevector, noiseindex, state):
-    testinfoseq = generateInputVectors(blocklength, testsize)
-    #    testinfoseq[:,0]=1
-
-    testcodedseq = np.array(
-        list(
-            map(
-                encode133171,
-                testinfoseq.tolist(),
-                state * np.ones(len(testinfoseq), dtype=np.uint8),
-            )
-        )
-    )
-    for i in range(testsize):
-        testcodedseq[i, :] = modulateAwgn(testcodedseq[i, :], noisevector[noiseindex])
-    return (testinfoseq, testcodedseq)
-
-def main()
-    tf.reset_default_graph()
+def generate_test_data(
+    config: BitwiseDecoderConfig
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generate test dataset with fixed SNR value.
     
-    # Network Parameters node numbers
-    n_hidden_1 = 30  #
-    n_hidden_2 = 100  #
-    n_hidden_3 = 100
-    n_hidden_4 = 100
-    # number of input layer node must have same dimensionality as input size
-    n_input = 2 * totallength
-    
-    # How many blocklength of block will be used for training ans test more trainingsize may give better result
-    trainingsize = 300000
-    testsize = 300000
-    
-    # Prapare different snr values
-    snrdbvec = np.arange(-2, 9)
-    SNR = 10 ** (snrdbvec / 10)
-    N0 = 1 / SNR
-    sigma = np.sqrt(N0 * 0.5)
-    
-    # test vectors will go through this level of snr lower index will give high error since it has more noise power
-    chosentestsnrindex = 0
-    chosenbitposition = 0
-    startingstate = 0
-    
-    learning_rate = 0.0002
-    training_epochs = 300
-    batch_size = 1000
-    display_step = 1
-    
-    # Saving directory
-    trainedmodeldirectory = "./neuralviterbi/mymodelfirstbitpredict"
-    testmodeldirectory = "./neuralviterbi/mymodelfirstbitpredict"
-    # False means train new one that will be saved spesified directory
-    testoldmodel = False
-    
-    beta = 0.0001
-    
-    tf.reset_default_graph()
-    sess = tf.InteractiveSession()
-    
-    # Generate information and encoded stream
-    traininfoseq, traincodedseq = generateTrainData(
-        blocklength, trainingsize, sigma, startingstate
-    )
-    testinfoseq, testcodedseq = generateTestData(
-        blocklength, testsize, sigma, chosentestsnrindex, startingstate
+    Args:
+        config: Decoder configuration
+        
+    Returns:
+        Tuple of (info_sequences, encoded_sequences)
+    """
+    # Generate random information sequences
+    info_seq = generate_input_vectors(
+        config.block_length,
+        config.test_size
     )
     
-    # Spesified bit positiomn of info sequnce will be binary label this is whar are we trying to predict
+    # Encode all sequences
+    encoded_seq = np.array([
+        encode_133171_with_state(seq, config.starting_state)
+        for seq in info_seq
+    ])
     
-    trainlabels = traininfoseq[:, chosenbitposition]
-    testlabels = testinfoseq[:, chosenbitposition]
+    # Add noise with fixed test SNR
+    test_sigma = config.sigma_vec[config.test_snr_index]
+    for i in range(config.test_size):
+        encoded_seq[i, :] = modulate_awgn(encoded_seq[i, :], test_sigma)
     
-    # Generate one hot represantion of labels this is accepted inpt type of network
-    onehottraininglabels = np.zeros([trainingsize, 2], dtype=np.float16)
-    onehottestlabels = np.zeros([testsize, 2], dtype=np.float16)
-    for i in range(trainingsize):
-        onehottraininglabels[i, int(trainlabels[i])] = 1
-        if i < len(testlabels):
-            onehottestlabels[i, int(testlabels[i])] = 1
+    return info_seq, encoded_seq
+
+
+# ==============================================================================
+# NEURAL NETWORK MODEL
+# ==============================================================================
+
+def build_network(
+    x: tf.Tensor,
+    config: BitwiseDecoderConfig
+) -> Tuple[tf.Tensor, Dict[str, tf.Variable], Dict[str, tf.Variable]]:
+    """
+    Build feedforward neural network for binary classification.
     
-    trainlabels = onehottraininglabels
-    testlabels = onehottestlabels
-    
-    x = tf.placeholder("float", [None, n_input])
-    y = tf.placeholder("float", [None, 2])
-    keep_prob = tf.placeholder("float")
-    
-    
-    # Create model
-    def multilayer_perceptron(x, weights, biases):
-        layer_1 = tf.add(tf.matmul(x, weights["h1"]), biases["b1"])
-        layer_1 = tf.nn.relu(layer_1)
-    
-        #    layer_2 = tf.add(tf.matmul(layer_1, weights['h2']), biases['b2'])
-        #    layer_2 = tf.nn.relu(layer_2)
-    
-        #    layer_3 = tf.add(tf.matmul(layer_2, weights['h3']), biases['b3'])
-        #    layer_3 = tf.nn.relu(layer_3)
-        #
-        #
-        #    layer_4 = tf.add(tf.matmul(layer_3, weights['h3']), biases['b3'])
-        #    layer_4 = tf.nn.relu(layer_4)
-    
-        out_layer = tf.matmul(layer_1, weights["out"]) + biases["out"]
-        out_layer = tf.nn.relu(out_layer)
-    
-        return out_layer
-    
-    
-    # Store layers weight & bias
+    Args:
+        x: Input placeholder tensor
+        config: Decoder configuration
+        
+    Returns:
+        Tuple of (output_layer, weights_dict, biases_dict)
+    """
+    # Initialize weights with Xavier initialization
     weights = {
-        "h1": tf.Variable(
-            tf.truncated_normal([n_input, n_hidden_1], stddev=math.sqrt(2.0 / (n_input)))
-        ),
-        "h2": tf.Variable(
+        'h1': tf.Variable(
             tf.truncated_normal(
-                [n_hidden_1, n_hidden_2], stddev=math.sqrt(2.0 / (n_hidden_1))
-            )
+                [config.n_input, config.n_hidden_1],
+                stddev=math.sqrt(2.0 / config.n_input)
+            ),
+            name='weights_h1'
         ),
-        "h3": tf.Variable(
+        'h2': tf.Variable(
             tf.truncated_normal(
-                [n_hidden_2, n_hidden_3], stddev=math.sqrt(2.0 / (n_hidden_2))
-            )
+                [config.n_hidden_1, config.n_hidden_2],
+                stddev=math.sqrt(2.0 / config.n_hidden_1)
+            ),
+            name='weights_h2'
         ),
-        "h4": tf.Variable(
+        'h3': tf.Variable(
             tf.truncated_normal(
-                [n_hidden_3, n_hidden_4], stddev=math.sqrt(2.0 / (n_hidden_3))
-            )
+                [config.n_hidden_2, config.n_hidden_3],
+                stddev=math.sqrt(2.0 / config.n_hidden_2)
+            ),
+            name='weights_h3'
         ),
-        "out": tf.Variable(
-            tf.truncated_normal([n_hidden_1, 2], stddev=math.sqrt(2.0 / (n_hidden_4)))
+        'h4': tf.Variable(
+            tf.truncated_normal(
+                [config.n_hidden_3, config.n_hidden_4],
+                stddev=math.sqrt(2.0 / config.n_hidden_3)
+            ),
+            name='weights_h4'
+        ),
+        'out': tf.Variable(
+            tf.truncated_normal(
+                [config.n_hidden_1, config.n_output],
+                stddev=math.sqrt(2.0 / config.n_hidden_4)
+            ),
+            name='weights_out'
         ),
     }
+    
     biases = {
-        "b1": tf.Variable(tf.zeros([n_hidden_1])),
-        "b2": tf.Variable(tf.zeros([n_hidden_2])),
-        "b3": tf.Variable(tf.zeros([n_hidden_3])),
-        "b4": tf.Variable(tf.zeros([n_hidden_4])),
-        "out": tf.Variable(tf.zeros([2])),
+        'b1': tf.Variable(tf.zeros([config.n_hidden_1]), name='bias_h1'),
+        'b2': tf.Variable(tf.zeros([config.n_hidden_2]), name='bias_h2'),
+        'b3': tf.Variable(tf.zeros([config.n_hidden_3]), name='bias_h3'),
+        'b4': tf.Variable(tf.zeros([config.n_hidden_4]), name='bias_h4'),
+        'out': tf.Variable(tf.zeros([config.n_output]), name='bias_out'),
     }
     
-    # Construct model
-    # pred = multilayer_perceptron_withdropout(x, weights, biases, keep_prob)
-    pred = multilayer_perceptron(x, weights, biases)
+    # Build network layers with ReLU activation
+    layer_1 = tf.nn.relu(tf.matmul(x, weights['h1']) + biases['b1'])
     
-    # Define loss and optimizer
+    # Note: Layers 2-4 are commented out to reduce complexity
+    # Uncomment if needed for better performance
+    # layer_2 = tf.nn.relu(tf.matmul(layer_1, weights['h2']) + biases['b2'])
+    # layer_3 = tf.nn.relu(tf.matmul(layer_2, weights['h3']) + biases['b3'])
+    # layer_4 = tf.nn.relu(tf.matmul(layer_3, weights['h4']) + biases['b4'])
     
+    # Output layer (logits for binary classification)
+    output = tf.nn.relu(tf.matmul(layer_1, weights['out']) + biases['out'])
+    
+    return output, weights, biases
+
+
+# ==============================================================================
+# TRAINING AND EVALUATION
+# ==============================================================================
+
+def train_and_evaluate(
+    config: BitwiseDecoderConfig,
+    train_info: np.ndarray,
+    train_encoded: np.ndarray,
+    test_info: np.ndarray,
+    test_encoded: np.ndarray,
+    model_save_path: Optional[str] = None
+) -> Tuple[np.ndarray, float]:
+    """
+    Train the neural network and evaluate on test set.
+    
+    Args:
+        config: Decoder configuration
+        train_info: Training information sequences
+        train_encoded: Training encoded sequences (noisy)
+        test_info: Test information sequences
+        test_encoded: Test encoded sequences (noisy)
+        model_save_path: Path to save trained model (optional)
+        
+    Returns:
+        Tuple of (predictions, error_rate)
+    """
+    # Reset TensorFlow graph
+    tf.reset_default_graph()
+    
+    # Create placeholders
+    x = tf.placeholder("float", [None, config.n_input], name='input')
+    y = tf.placeholder("float", [None, config.n_output], name='labels')
+    
+    # Build network
+    pred, weights, biases = build_network(x, config)
+    
+    # Define loss function (binary cross-entropy)
     cost = tf.reduce_mean(
-        tf.nn.sigmoid_cross_entropy_with_logits(logits=pred, labels=y, name=None)
+        tf.nn.sigmoid_cross_entropy_with_logits(logits=pred, labels=y)
     )
     
-    regularizer = tf.nn.l2_loss(weights["h1"]) + tf.nn.l2_loss(weights["h2"])
+    # Add L2 regularization
+    regularizer = (
+        tf.nn.l2_loss(weights['h1']) + 
+        tf.nn.l2_loss(weights['h2'])
+    )
+    cost = tf.reduce_mean(cost + config.beta_regularization * regularizer)
     
-    cost = tf.reduce_mean(cost + beta * regularizer)
+    # Define optimizer
+    optimizer = tf.train.AdamOptimizer(
+        learning_rate=config.learning_rate
+    ).minimize(cost)
     
-    optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate).minimize(cost)
+    # Prepare labels for specified bit position
+    train_labels = train_info[:, config.bit_position]
+    test_labels = test_info[:, config.bit_position]
     
-    # Initializing the variables
+    # Convert to one-hot encoding
+    train_labels_onehot = np.zeros((config.training_size, 2), dtype=np.float16)
+    test_labels_onehot = np.zeros((config.test_size, 2), dtype=np.float16)
+    
+    for i in range(config.training_size):
+        train_labels_onehot[i, int(train_labels[i])] = 1
+    for i in range(config.test_size):
+        test_labels_onehot[i, int(test_labels[i])] = 1
+    
+    # Initialize session
     init = tf.global_variables_initializer()
-    
     saver = tf.train.Saver()
     
-    # Launch the graph
-    if testoldmodel:
-        with tf.Session() as session:
-            saver = tf.train.import_meta_graph(testmodeldirectory)
-            saver.restore(session, tf.train.latest_checkpoint("./"))
+    with tf.Session() as sess:
+        sess.run(init)
+        
+        # Training loop
+        for epoch in range(config.training_epochs):
+            avg_cost = 0.0
+            total_batch = int(config.training_size / config.batch_size)
+            
+            # Mini-batch training
+            for i in range(total_batch):
+                batch_x = train_encoded[
+                    i * config.batch_size:(i + 1) * config.batch_size, :
+                ]
+                batch_y = train_labels_onehot[
+                    i * config.batch_size:(i + 1) * config.batch_size
+                ]
+                
+                _, c = sess.run([optimizer, cost], feed_dict={x: batch_x, y: batch_y})
+                avg_cost += c / total_batch
+            
+            # Display progress
+            if epoch % config.display_step == 0:
+                print(f"Epoch: {epoch + 1:04d} | cost = {avg_cost:.9f}")
+        
+        print("Optimization Finished!")
+        
+        # Save model if path provided
+        if model_save_path:
+            saver.save(sess, model_save_path)
+            print(f"Model saved to {model_save_path}")
+        
+        # Evaluate on test set
+        predictions_tensor = tf.argmax(pred, 1)
+        predictions = predictions_tensor.eval(feed_dict={x: test_encoded})
+        
+        # Calculate error rate
+        errors = np.sum(predictions != test_labels.astype(int))
+        error_rate = errors / len(predictions)
+        
+        print(f"Test Error Rate: {error_rate:.6f}")
+        print(f"Test Accuracy: {1 - error_rate:.6f}")
+        
+        return predictions, error_rate
+
+
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
+
+def main() -> None:
+    """
+    Main function for bitwise neural Viterbi decoder.
+    """
+    print("=" * 70)
+    print("Bitwise Neural Viterbi Decoder")
+    print("=" * 70)
     
-            correct_prediction = tf.equal(tf.argmax(pred, 1), tf.argmax(y, 1))
-            g = tf.argmax(pred, 1)
-            # test prediction values
-            predictions = g.eval(feed_dict={x: testcodedseq})
-            testprediction = pred.eval(feed_dict={x: testcodedseq})
-            testpredictioncopy = testprediction
+    # Initialize configuration
+    config = BitwiseDecoderConfig(
+        constraint_length=6,
+        block_length=512,
+        n_hidden_1=30,
+        learning_rate=0.0002,
+        training_epochs=300,
+        batch_size=1000,
+        training_size=300000,
+        test_size=300000,
+        test_snr_index=0,  # Test at lowest SNR
+        bit_position=0,    # Predict first bit
+    )
     
-            trainingprediction = pred.eval(feed_dict={x: traincodedseq})
-    else:
-        with tf.Session() as sess:
-            sess.run(init)
+    print("\nConfiguration:")
+    print(f"  Block Length: {config.block_length}")
+    print(f"  Constraint Length: {config.constraint_length}")
+    print(f"  Predicting Bit Position: {config.bit_position}")
+    print(f"  Test SNR: {config.snr_db_vec[config.test_snr_index]} dB")
+    print(f"  Training Samples: {config.training_size}")
+    print(f"  Test Samples: {config.test_size}")
     
-            # Training cycle
-            for epoch in range(training_epochs):
-                avg_cost = 0.0
-                total_batch = int(trainingsize / batch_size)
-                # Loop over all batches
-                for i in range(total_batch):
-                    batch_x = traincodedseq[i * batch_size : (i + 1) * batch_size, :]
-                    batch_y = trainlabels[i * batch_size : (i + 1) * batch_size]
-                    # Run optimization op (backprop) and cost op (to get loss value)
-                    _, c = sess.run([optimizer, cost], feed_dict={x: batch_x, y: batch_y})
+    # Generate data
+    print("\nGenerating training data...")
+    train_info, train_encoded = generate_training_data(config)
     
-                    #                trainpredictions = pred.eval(feed_dict = {x:trainingencodedseq})
-                    #                ber = calBer(trainpredictions,traininginfoseq)
-                    # Compute average loss
-                    avg_cost += c / total_batch
-                # Display logs per epoch step
-                if epoch % display_step == 0:
-                    #                print("ber:" , ber )
-                    print(
-                        "Epoch:", "%04d" % (epoch + 1), "cost=", "{:.9f}".format(avg_cost)
-                    )
-            print("Optimization Finished!")
-            saver.save(sess, trainedmodeldirectory)
-            # Test model
-            correct_prediction = tf.equal(tf.argmax(pred, 1), tf.argmax(y, 1))
-            g = tf.argmax(pred, 1)
-            predictions = g.eval(feed_dict={x: testcodedseq})
-            conf = pred.eval(feed_dict={x: testcodedseq})
-            testprediction = pred.eval(feed_dict={x: testcodedseq})
-            testpredictioncopy = testprediction
-            trainingprediction = pred.eval(feed_dict={x: traincodedseq})
+    print("Generating test data...")
+    test_info, test_encoded = generate_test_data(config)
     
-    # Calculate errors
-    packeterrnum = 0
-    testlabels = testinfoseq[:, chosenbitposition]
-    testlabels = testlabels.astype(int)
-    for i in range(len(predictions)):
-        if predictions[i] != testlabels[i]:
-            packeterrnum = packeterrnum + 1
+    # Train and evaluate
+    print("\nTraining neural network...")
+    predictions, error_rate = train_and_evaluate(
+        config,
+        train_info,
+        train_encoded,
+        test_info,
+        test_encoded
+    )
     
-    frameerror = packeterrnum / len(predictions)
-    print("error = ", frameerror)
-    
+    print("\n" + "=" * 70)
+    print("Decoding complete!")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
