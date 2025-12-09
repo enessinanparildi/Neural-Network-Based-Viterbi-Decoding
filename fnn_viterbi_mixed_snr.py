@@ -14,7 +14,7 @@ Key Features:
     - Dropout regularization option
     - Configurable network architecture
 
-Author: Enes
+Author: Fahrettin, Enes
 Date: July 12, 2017
 Improved: December 2024
 """
@@ -801,4 +801,134 @@ def create_model_graph(
                 test_labels_decimal,
                 config.block_length
             )
-            print
+            print(f"Test Set BER: {ber:.6f}")
+    
+    else:
+        # Evaluation mode (load existing model)
+        with tf.Session() as sess:
+            if model_load_path:
+                saver.restore(sess, model_load_path)
+                print(f"Model loaded from {model_load_path}")
+            
+            correct_prediction = tf.equal(tf.argmax(test_model, 1), tf.argmax(y, 1))
+            predictions_tensor = tf.argmax(test_model, 1)
+            
+            # Evaluate on standard test set
+            if config.use_random_test_set and random_test_set is not None:
+                predictions = predictions_tensor.eval(feed_dict={x: random_test_set})
+                accuracy = tf.reduce_mean(tf.cast(correct_prediction, "float"))
+                test_accuracy = accuracy.eval({x: random_test_set, y: random_test_labels})
+                
+                print(f"Random Test Set Accuracy: {test_accuracy:.4f}")
+                
+                # Calculate BER
+                random_labels_decimal = np.argmax(random_test_labels, axis=1)
+                ber = calculate_ber(
+                    predictions,
+                    random_labels_decimal,
+                    config.block_length
+                )
+                print(f"Random Test Set BER: {ber:.6f}")
+            else:
+                predictions = predictions_tensor.eval(feed_dict={x: test_set})
+                accuracy = tf.reduce_mean(tf.cast(correct_prediction, "float"))
+                test_accuracy = accuracy.eval({x: test_set, y: test_labels})
+                
+                print(f"Test Set Accuracy: {test_accuracy:.4f}")
+                
+                test_labels_decimal = np.argmax(test_labels, axis=1)
+                ber = calculate_ber(
+                    predictions,
+                    test_labels_decimal,
+                    config.block_length
+                )
+                print(f"Test Set BER: {ber:.6f}")
+
+
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
+
+def main() -> None:
+    """
+    Main function for mixed SNR neural Viterbi decoder.
+    """
+    print("=" * 70)
+    print("Mixed SNR Neural Viterbi Decoder")
+    print("=" * 70)
+    
+    # Initialize configuration
+    config = MixedSNRDecoderConfig(
+        block_length=7,
+        rate=2,
+        n_hidden_1=128,
+        n_hidden_2=64,
+        n_hidden_3=32,
+        learning_rate=0.0001,
+        training_epochs=300,
+        batch_size=256,
+        beta_regularization=0.001,
+        samples_per_class_train=1000,
+        samples_per_class_test=10000,
+        snr_db_range=(-2, 10),
+        test_snr_index=0,
+        use_dropout=False,
+        use_random_test_set=False,
+    )
+    
+    print("\nConfiguration:")
+    print(f"  Block Length: {config.block_length}")
+    print(f"  Number of Classes: {config.num_classes}")
+    print(f"  Training SNR Range: {config.snr_db_vec[0]} to {config.snr_db_vec[-1]} dB")
+    print(f"  Test SNR: {config.snr_db_vec[config.test_snr_index]} dB")
+    print(f"  Training Samples: {config.num_training_samples}")
+    print(f"  Test Samples: {config.num_test_samples}")
+    print(f"  Use Dropout: {config.use_dropout}")
+    print(f"  Network: {config.n_input} -> {config.n_hidden_1} -> "
+          f"{config.n_hidden_2} -> {config.n_hidden_3} -> {config.n_classes}")
+    
+    # Generate datasets
+    print("\nGenerating datasets...")
+    (
+        training_set,
+        test_set,
+        training_labels,
+        random_test_labels,
+        random_test_set,
+        class_bits,
+    ) = get_dataset(config)
+    
+    print(f"Training set shape: {training_set.shape}")
+    print(f"Test set shape: {test_set.shape}")
+    
+    # Train and evaluate
+    print("\nTraining neural network...")
+    
+    # For standard test set, convert to one-hot
+    test_labels_decimal = np.arange(config.all_classes).repeat(
+        config.samples_per_class_test
+    )
+    test_labels_onehot = create_one_hot_labels(
+        test_labels_decimal,
+        config.n_classes
+    )
+    
+    create_model_graph(
+        config=config,
+        training_set=training_set,
+        training_labels=training_labels,
+        test_set=test_set,
+        test_labels=test_labels_onehot,
+        random_test_set=random_test_set,
+        random_test_labels=random_test_labels,
+        train_mode=True,
+        model_save_path="./models/mixed_snr_model"
+    )
+    
+    print("\n" + "=" * 70)
+    print("Decoding complete!")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
